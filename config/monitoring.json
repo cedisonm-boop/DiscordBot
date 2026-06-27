@@ -1,0 +1,20 @@
+{
+  "actions": ["mention", "forward"],
+  "defaultTerms": ["urgent", "refund", "chargeback", "security"],
+  "forwardChannelId": "REPLACE_ALERT_CHANNEL_ID",
+  "mentionInForward": false,
+  "mentionUserIds": [],
+  "monitoredChannelIds": [],
+  "channels": {
+    "REPLACE_MONITORED_CHANNEL_ID_1": {
+      "terms": ["refund", "chargeback", "payment"],
+      "mentionUserIds": ["REPLACE_USER_ID_TO_TAG"],
+      "forwardChannelId": "REPLACE_ALERT_CHANNEL_ID"
+    },
+    "REPLACE_MONITORED_CHANNEL_ID_2": {
+      "terms": ["security", "login", "password"],
+      "mentionUserIds": ["REPLACE_USER_ID_TO_TAG"],
+      "forwardChannelId": "REPLACE_ALERT_CHANNEL_ID"
+    }
+  }
+}

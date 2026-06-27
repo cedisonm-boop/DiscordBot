@@ -1,5 +1,7 @@
 import "dotenv/config";
 
+import { readFile } from "node:fs/promises";
+
 import { Client, EmbedBuilder, Events, GatewayIntentBits } from "discord.js";
 import OpenAI from "openai";
 import { zodTextFormat } from "openai/helpers/zod";
@@ -9,10 +11,18 @@ const env = {
   discordToken: process.env.DISCORD_TOKEN,
   openAiApiKey: process.env.OPENAI_API_KEY,
   openAiModel: process.env.OPENAI_MODEL || "gpt-5.5",
+  channelRules: parseChannelRules(process.env.CHANNEL_RULES),
+  channelMentionUserIds: parseChannelMentionUserIds(process.env.CHANNEL_MENTION_USER_IDS),
+  configFile: process.env.MONITORING_CONFIG_FILE || "config/monitoring.json",
+  configUrl: process.env.MONITORING_CONFIG_URL,
+  configRefreshSeconds: Number(process.env.MONITORING_CONFIG_REFRESH_SECONDS || "300"),
   monitoredChannelIds: parseList(process.env.MONITORED_CHANNEL_IDS),
   watchTerms: parseList(process.env.WATCH_TERMS),
   alertActions: new Set(parseList(process.env.ALERT_ACTIONS || "mention,forward")),
-  mentionUserId: process.env.MENTION_USER_ID,
+  mentionUserIds: uniqueList([
+    ...parseList(process.env.MENTION_USER_IDS),
+    ...parseList(process.env.MENTION_USER_ID)
+  ]),
   forwardChannelId: process.env.FORWARD_CHANNEL_ID,
   mentionInForward: parseBoolean(process.env.MENTION_IN_FORWARD, false)
 };
@@ -20,6 +30,7 @@ const env = {
 validateConfig(env);
 
 const openai = new OpenAI({ apiKey: env.openAiApiKey });
+let monitoringConfig = buildEnvMonitoringConfig();
 
 const client = new Client({
   intents: [
@@ -41,18 +52,23 @@ client.once(Events.ClientReady, (readyClient) => {
   console.log(`Logged in as ${readyClient.user.tag}`);
 });
 
+await loadMonitoringConfig();
+startConfigRefresh();
+
 client.on(Events.MessageCreate, async (message) => {
   try {
     if (message.author.bot) return;
-    if (!shouldMonitorChannel(message.channelId)) return;
 
-    const matchedTerms = getMatchedTerms(message.content);
-    if (env.watchTerms.length > 0 && matchedTerms.length === 0) return;
+    const channelRule = getChannelRule(message.channelId);
+    if (!channelRule) return;
 
-    const analysis = await analyzeMessage(message, matchedTerms);
+    const matchedTerms = getMatchedTerms(message.content, channelRule.terms);
+    if (channelRule.terms.length > 0 && matchedTerms.length === 0) return;
+
+    const analysis = await analyzeMessage(message, matchedTerms, channelRule.terms);
     if (!analysis.shouldAlert) return;
 
-    await runAlertActions(message, analysis, matchedTerms);
+    await runAlertActions(message, analysis, matchedTerms, channelRule);
   } catch (error) {
     console.error("Failed to process message:", error);
   }
@@ -72,20 +88,60 @@ function parseBoolean(value, fallback) {
   return ["1", "true", "yes", "on"].includes(value.toLowerCase());
 }
 
+function parseChannelRules(value) {
+  return parseChannelMap(value, "CHANNEL_RULES", "terms");
+}
+
+function parseChannelMentionUserIds(value) {
+  return parseChannelMap(value, "CHANNEL_MENTION_USER_IDS", "userIds");
+}
+
+function parseChannelMap(value, envName, valueKey) {
+  if (!value) return [];
+
+  return value
+    .split(";")
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => {
+      const separatorIndex = entry.indexOf(":");
+
+      if (separatorIndex === -1) {
+        throw new Error(`Invalid ${envName} entry: ${entry}`);
+      }
+
+      const channelId = entry.slice(0, separatorIndex).trim();
+      const values = entry
+        .slice(separatorIndex + 1)
+        .split("|")
+        .map((valuePart) => valuePart.trim())
+        .filter(Boolean);
+
+      if (!channelId) {
+        throw new Error(`Invalid ${envName} entry with empty channel ID: ${entry}`);
+      }
+
+      return { channelId, [valueKey]: uniqueList(values) };
+    });
+}
+
+function uniqueList(values) {
+  return [...new Set(values.filter(Boolean))];
+}
+
+function parseStringList(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item).trim()).filter(Boolean);
+  }
+
+  return parseList(value);
+}
+
 function validateConfig(config) {
   const missing = [];
 
   if (!config.discordToken) missing.push("DISCORD_TOKEN");
   if (!config.openAiApiKey) missing.push("OPENAI_API_KEY");
-  if (config.alertActions.has("mention") && !config.mentionUserId) {
-    missing.push("MENTION_USER_ID");
-  }
-  if (config.alertActions.has("forward") && !config.forwardChannelId) {
-    missing.push("FORWARD_CHANNEL_ID");
-  }
-  if (config.mentionInForward && !config.mentionUserId) {
-    missing.push("MENTION_USER_ID");
-  }
 
   for (const action of config.alertActions) {
     if (!["mention", "forward"].includes(action)) {
@@ -98,16 +154,43 @@ function validateConfig(config) {
   }
 }
 
-function shouldMonitorChannel(channelId) {
-  return env.monitoredChannelIds.length === 0 || env.monitoredChannelIds.includes(channelId);
+function getChannelRule(channelId) {
+  const rule = monitoringConfig.channels[channelId];
+
+  if (rule) {
+    return {
+      channelId,
+      terms: rule.terms,
+      mentionUserIds: rule.mentionUserIds,
+      forwardChannelId: rule.forwardChannelId
+    };
+  }
+
+  if (Object.keys(monitoringConfig.channels).length > 0) {
+    return null;
+  }
+
+  if (
+    monitoringConfig.monitoredChannelIds.length > 0 &&
+    !monitoringConfig.monitoredChannelIds.includes(channelId)
+  ) {
+    return null;
+  }
+
+  return {
+    channelId,
+    terms: monitoringConfig.defaultTerms,
+    mentionUserIds: monitoringConfig.mentionUserIds,
+    forwardChannelId: monitoringConfig.forwardChannelId
+  };
 }
 
-function getMatchedTerms(content) {
+function getMatchedTerms(content, terms) {
   const lowerContent = content.toLowerCase();
-  return env.watchTerms.filter((term) => lowerContent.includes(term.toLowerCase()));
+  return terms.filter((term) => lowerContent.includes(term.toLowerCase()));
 }
 
-async function analyzeMessage(message, matchedTerms) {
+async function analyzeMessage(message, matchedTerms, watchedTerms) {
   const response = await openai.responses.parse({
     model: env.openAiModel,
     reasoning: { effort: "low" },
@@ -127,7 +210,7 @@ async function analyzeMessage(message, matchedTerms) {
           author: message.author.tag,
           channelId: message.channelId,
           matchedTerms,
-          watchedTerms: env.watchTerms,
+          watchedTerms,
           message: message.content
         })
       }
@@ -144,31 +227,47 @@ async function analyzeMessage(message, matchedTerms) {
   return response.output_parsed;
 }
 
-async function runAlertActions(message, analysis, matchedTerms) {
-  if (env.alertActions.has("mention")) {
-    await mentionUserInSourceChannel(message, analysis);
+async function runAlertActions(message, analysis, matchedTerms, channelRule) {
+  const mentionUserIds = getMentionUserIds(channelRule);
+
+  if (monitoringConfig.actions.has("mention")) {
+    await mentionUserInSourceChannel(message, analysis, mentionUserIds);
   }
 
-  if (env.alertActions.has("forward")) {
-    await forwardAlert(message, analysis, matchedTerms);
+  if (monitoringConfig.actions.has("forward")) {
+    await forwardAlert(message, analysis, matchedTerms, mentionUserIds, channelRule.forwardChannelId);
   }
 }
 
-async function mentionUserInSourceChannel(message, analysis) {
+function getMentionUserIds(channelRule) {
+  return channelRule.mentionUserIds.length > 0
+    ? channelRule.mentionUserIds
+    : monitoringConfig.mentionUserIds;
+}
+
+function formatMentions(userIds) {
+  return userIds.map((userId) => `<@${userId}>`).join(" ");
+}
+
+async function mentionUserInSourceChannel(message, analysis, mentionUserIds) {
+  if (mentionUserIds.length === 0) return;
+
   await message.channel.send({
     content: [
-      `<@${env.mentionUserId}>`,
+      formatMentions(mentionUserIds),
       `Flagged ${analysis.priority} priority ${analysis.category}: ${analysis.summary}`,
       message.url
     ].join("\n"),
     allowedMentions: {
-      users: [env.mentionUserId]
+      users: mentionUserIds
     }
   });
 }
 
-async function forwardAlert(message, analysis, matchedTerms) {
-  const channel = await client.channels.fetch(env.forwardChannelId);
+async function forwardAlert(message, analysis, matchedTerms, mentionUserIds, forwardChannelId) {
+  if (!forwardChannelId) return;
+
+  const channel = await client.channels.fetch(forwardChannelId);
 
   if (!channel?.isTextBased()) {
     throw new Error("FORWARD_CHANNEL_ID must be a text-based channel.");
@@ -208,13 +307,15 @@ async function forwardAlert(message, analysis, matchedTerms) {
     )
     .setTimestamp(message.createdAt);
 
-  const mentionContent = env.mentionInForward ? `<@${env.mentionUserId}>` : undefined;
+  const mentionContent = monitoringConfig.mentionInForward && mentionUserIds.length > 0
+    ? formatMentions(mentionUserIds)
+    : undefined;
 
   await channel.send({
     content: mentionContent,
     embeds: [embed],
     allowedMentions: {
-      users: env.mentionInForward && env.mentionUserId ? [env.mentionUserId] : []
+      users: monitoringConfig.mentionInForward ? mentionUserIds : []
     }
   });
 }
@@ -229,4 +330,100 @@ function truncate(value, maxLength) {
   if (!value) return "[empty]";
   if (value.length <= maxLength) return value;
   return `${value.slice(0, maxLength - 3)}...`;
+}
+
+async function loadMonitoringConfig() {
+  try {
+    const nextConfig = env.configUrl
+      ? normalizeMonitoringConfig(await fetchMonitoringConfig(env.configUrl))
+      : normalizeMonitoringConfig(JSON.parse(await readFile(env.configFile, "utf8")));
+
+    monitoringConfig = nextConfig;
+    console.log("Monitoring config loaded.");
+  } catch (error) {
+    if (error.code === "ENOENT" && !env.configUrl) {
+      console.log("No monitoring config file found; using .env monitoring settings.");
+      return;
+    }
+
+    console.error("Failed to load monitoring config; keeping previous settings:", error);
+  }
+}
+
+async function fetchMonitoringConfig(url) {
+  const response = await fetch(url, {
+    headers: {
+      accept: "application/json"
+    }
+  });
+
+  if (!response.ok) {
+    throw new Error(`Config request failed with status ${response.status}`);
+  }
+
+  return response.json();
+}
+
+function startConfigRefresh() {
+  if (env.configRefreshSeconds <= 0) return;
+
+  setInterval(() => {
+    loadMonitoringConfig();
+  }, env.configRefreshSeconds * 1000);
+}
+
+function buildEnvMonitoringConfig() {
+  const channelMentionsById = new Map(
+    env.channelMentionUserIds.map((rule) => [rule.channelId, rule.userIds])
+  );
+  const channels = Object.fromEntries(
+    env.channelRules.map((rule) => [
+      rule.channelId,
+      {
+        terms: rule.terms,
+        mentionUserIds: channelMentionsById.get(rule.channelId) || [],
+        forwardChannelId: env.forwardChannelId || ""
+      }
+    ])
+  );
+
+  return normalizeMonitoringConfig({
+    actions: [...env.alertActions],
+    defaultTerms: env.watchTerms,
+    forwardChannelId: env.forwardChannelId || "",
+    mentionInForward: env.mentionInForward,
+    mentionUserIds: env.mentionUserIds,
+    monitoredChannelIds: env.monitoredChannelIds,
+    channels
+  });
+}
+
+function normalizeMonitoringConfig(config) {
+  const normalizedChannels = {};
+
+  for (const [channelId, channelConfig] of Object.entries(config.channels || {})) {
+    normalizedChannels[channelId] = {
+      terms: parseStringList(channelConfig.terms || channelConfig.watchTerms),
+      mentionUserIds: parseStringList(channelConfig.mentionUserIds || channelConfig.mentionUserId),
+      forwardChannelId: String(channelConfig.forwardChannelId || config.forwardChannelId || "")
+    };
+  }
+
+  const actions = parseStringList(config.actions || config.alertActions || [...env.alertActions]);
+
+  for (const action of actions) {
+    if (!["mention", "forward"].includes(action)) {
+      throw new Error(`Unsupported monitoring config action: ${action}`);
+    }
+  }
+
+  return {
+    actions: new Set(actions),
+    channels: normalizedChannels,
+    defaultTerms: parseStringList(config.defaultTerms || config.watchTerms || env.watchTerms),
+    forwardChannelId: String(config.forwardChannelId || env.forwardChannelId || ""),
+    mentionInForward: Boolean(config.mentionInForward ?? env.mentionInForward),
+    mentionUserIds: parseStringList(config.mentionUserIds || config.mentionUserId || env.mentionUserIds),
+    monitoredChannelIds: parseStringList(config.monitoredChannelIds || env.monitoredChannelIds)
+  };
 }

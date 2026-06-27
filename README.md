@@ -22,13 +22,42 @@ npm start
 
 ## Configuration
 
+For easiest cloud use, keep secrets in Lightsail `.env` and edit channel routing in [config/monitoring.json](config/monitoring.json) on GitHub.
+
+Set this once in Lightsail `.env`:
+
+```bash
+MONITORING_CONFIG_URL=https://raw.githubusercontent.com/cedisonm-boop/DiscordBot/main/config/monitoring.json
+MONITORING_CONFIG_REFRESH_SECONDS=300
+```
+
+Then edit `config/monitoring.json` in GitHub whenever you need to change watched channels, keywords, tagged users, or forwarding channels. The bot reloads it automatically every 5 minutes by default.
+
 `MONITORED_CHANNEL_IDS` controls which Discord channels are watched. Use comma-separated channel IDs, or leave it blank to watch every text channel the bot can access.
 
 `WATCH_TERMS` controls the first filter. If any term appears in a message, the bot sends the message to OpenAI for analysis. Leave it blank to analyze every message in monitored channels.
 
+`CHANNEL_RULES` lets different channels use different watched terms. Use this format:
+
+```bash
+CHANNEL_RULES=111111111111111111:refund|chargeback|payment;222222222222222222:security|login|password
+```
+
+When `CHANNEL_RULES` is set, it overrides `MONITORED_CHANNEL_IDS` and `WATCH_TERMS`.
+
+`MENTION_USER_ID` sets one global user to tag. `MENTION_USER_IDS` sets multiple global users, separated by commas.
+
+`CHANNEL_MENTION_USER_IDS` lets different channels tag different users. Use this format:
+
+```bash
+CHANNEL_MENTION_USER_IDS=111111111111111111:333333333333333333|444444444444444444;222222222222222222:555555555555555555
+```
+
+When `CHANNEL_MENTION_USER_IDS` is set for a channel, it overrides `MENTION_USER_ID` and `MENTION_USER_IDS` for that channel.
+
 `ALERT_ACTIONS` controls what happens after OpenAI decides a message needs attention:
 
-- `mention` posts a mention for `MENTION_USER_ID` in the source channel.
+- `mention` posts a mention for the configured user ID(s) in the source channel.
 - `forward` posts an alert in `FORWARD_CHANNEL_ID`.
 - Use both as `mention,forward`.
 
@@ -37,3 +66,7 @@ npm start
 Keep `.env` private. It contains both your Discord token and OpenAI API key.
 
 The bot ignores messages from other bots to avoid loops.
+
+## Cloud Deployment
+
+For AWS Lightsail deployment, see [docs/lightsail.md](docs/lightsail.md).

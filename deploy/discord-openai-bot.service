@@ -1,0 +1,17 @@
+[Unit]
+Description=Discord OpenAI channel monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/discord-openai-channel-monitor
+EnvironmentFile=/opt/discord-openai-channel-monitor/.env
+ExecStart=/usr/bin/npm start
+Restart=always
+RestartSec=10
+SyslogIdentifier=discord-openai-bot
+
+[Install]
+WantedBy=multi-user.target
