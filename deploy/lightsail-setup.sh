@@ -40,6 +40,11 @@ cd "$APP_DIR"
 echo "Installing app dependencies..."
 npm install --omit=dev
 
+mkdir -p data
+if [ ! -f data/monitoring.json ]; then
+  cp config/monitoring.json data/monitoring.json
+fi
+
 if [ ! -f .env ]; then
   cp .env.example .env
 fi

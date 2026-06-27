@@ -1,8 +1,25 @@
 import "dotenv/config";
 
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
 
-import { Client, EmbedBuilder, Events, GatewayIntentBits, PermissionFlagsBits } from "discord.js";
+import {
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  ChannelSelectMenuBuilder,
+  ChannelType,
+  Client,
+  EmbedBuilder,
+  Events,
+  GatewayIntentBits,
+  ModalBuilder,
+  PermissionFlagsBits,
+  StringSelectMenuBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+  UserSelectMenuBuilder
+} from "discord.js";
 import OpenAI from "openai";
 import { zodTextFormat } from "openai/helpers/zod";
 import { z } from "zod";
@@ -13,7 +30,7 @@ const env = {
   openAiModel: process.env.OPENAI_MODEL || "gpt-5.5",
   channelRules: parseChannelRules(process.env.CHANNEL_RULES),
   channelMentionUserIds: parseChannelMentionUserIds(process.env.CHANNEL_MENTION_USER_IDS),
-  configFile: process.env.MONITORING_CONFIG_FILE || "config/monitoring.json",
+  configFile: process.env.MONITORING_CONFIG_FILE || "data/monitoring.json",
   configUrl: process.env.MONITORING_CONFIG_URL,
   configRefreshSeconds: Number(process.env.MONITORING_CONFIG_REFRESH_SECONDS || "300"),
   monitoredChannelIds: parseList(process.env.MONITORED_CHANNEL_IDS),
@@ -41,6 +58,8 @@ const client = new Client({
 });
 const processedMessageIds = new Set();
 const maxRememberedMessageIds = 2000;
+const configUiPrefix = "monitor";
+const maxConfigSelectOptions = 25;
 
 const AnalysisResult = z.object({
   shouldAlert: z.boolean().describe("True only when the message should be acted on."),
@@ -65,6 +84,15 @@ client.on(Events.MessageCreate, async (message) => {
     await processCandidateMessage(message, { source: "live" });
   } catch (error) {
     console.error("Failed to process message:", error);
+  }
+});
+
+client.on(Events.InteractionCreate, async (interaction) => {
+  try {
+    await handleConfigInteraction(interaction);
+  } catch (error) {
+    console.error("Failed to process config interaction:", error);
+    await replyToInteractionError(interaction, error);
   }
 });
 
@@ -137,14 +165,24 @@ function validateConfig(config) {
   if (!config.discordToken) missing.push("DISCORD_TOKEN");
   if (!config.openAiApiKey) missing.push("OPENAI_API_KEY");
 
-  for (const action of config.alertActions) {
-    if (!["mention", "forward"].includes(action)) {
-      throw new Error(`Unsupported ALERT_ACTIONS value: ${action}`);
-    }
-  }
+  validateActions(config.alertActions, "ALERT_ACTIONS");
 
   if (missing.length > 0) {
     throw new Error(`Missing required environment values: ${missing.join(", ")}`);
+  }
+}
+
+function parseActionList(value, label) {
+  const actions = parseStringList(value);
+  validateActions(actions, label);
+  return actions;
+}
+
+function validateActions(actions, label) {
+  for (const action of actions) {
+    if (!["mention", "forward"].includes(action)) {
+      throw new Error(`Unsupported ${label} value: ${action}`);
+    }
   }
 }
 
@@ -154,9 +192,11 @@ function getChannelRule(channelId) {
   if (rule) {
     return {
       channelId,
+      actions: rule.actions,
       terms: rule.terms,
       mentionUserIds: rule.mentionUserIds,
       forwardChannelId: rule.forwardChannelId,
+      mentionInForward: rule.mentionInForward,
       analyzeWithOpenAI: rule.analyzeWithOpenAI
     };
   }
@@ -174,9 +214,11 @@ function getChannelRule(channelId) {
 
   return {
     channelId,
+    actions: monitoringConfig.actions,
     terms: monitoringConfig.defaultTerms,
     mentionUserIds: monitoringConfig.mentionUserIds,
     forwardChannelId: monitoringConfig.forwardChannelId,
+    mentionInForward: monitoringConfig.mentionInForward,
     analyzeWithOpenAI: monitoringConfig.analyzeWithOpenAI
   };
 }
@@ -331,17 +373,18 @@ function buildKeywordOnlyAnalysis(matchedTerms) {
 async function runAlertActions(message, analysis, matchedTerms, channelRule, searchableText) {
   const mentionUserIds = getMentionUserIds(channelRule);
 
-  if (monitoringConfig.actions.has("mention")) {
+  if (channelRule.actions.has("mention")) {
     await mentionUserInSourceChannel(message, analysis, mentionUserIds);
   }
 
-  if (monitoringConfig.actions.has("forward")) {
+  if (channelRule.actions.has("forward")) {
     await forwardAlert(
       message,
       analysis,
       matchedTerms,
       mentionUserIds,
       channelRule.forwardChannelId,
+      channelRule.mentionInForward,
       searchableText
     );
   }
@@ -373,6 +416,11 @@ async function handleMonitorCommand(message) {
 
   if (normalizedCommand === "status") {
     await message.reply(buildCommandStatus());
+    return true;
+  }
+
+  if (["panel", "config", "ui"].includes(normalizedCommand)) {
+    await message.channel.send(buildConfigPanelPayload());
     return true;
   }
 
@@ -409,7 +457,8 @@ function buildCommandHelp(prefix) {
   return [
     "Monitor commands:",
     `\`${prefix} status\` - show active routing.`,
-    `\`${prefix} reload\` - reload GitHub monitoring config now.`,
+    `\`${prefix} panel\` - show the Discord configuration panel.`,
+    `\`${prefix} reload\` - reload monitoring config now.`,
     `\`${prefix} backfill [limit]\` - scan recent messages in configured channels.`,
     `\`${prefix} backfill <channelId> [limit]\` - scan one channel.`,
     "Limit can be 1 to 100 because Discord only returns up to 100 messages per request."
@@ -426,7 +475,7 @@ function buildCommandStatus() {
     "Monitor is running.",
     `Command prefix: \`${monitoringConfig.commandPrefix}\``,
     `Configured source channels: ${configuredChannelIds.length > 0 ? configuredChannelIds.map((channelId) => `<#${channelId}>`).join(", ") : "default/global channels"}`,
-    `Actions: ${[...monitoringConfig.actions].join(", ") || "none"}`,
+    `Default actions: ${[...monitoringConfig.actions].join(", ") || "none"}`,
     `Default OpenAI analysis: ${monitoringConfig.analyzeWithOpenAI ? "on" : "off"}`,
     `Command access: ${commandUsers}`
   ].join("\n");
@@ -523,6 +572,476 @@ function clampFetchLimit(value) {
   return Math.max(1, Math.min(limit, 100));
 }
 
+async function handleConfigInteraction(interaction) {
+  if (!interaction.customId?.startsWith(`${configUiPrefix}:`)) {
+    return false;
+  }
+
+  if (!isInteractionAuthorized(interaction)) {
+    await interaction.reply({
+      content: "You are not allowed to use the configuration panel.",
+      ephemeral: true
+    });
+    return true;
+  }
+
+  if (interaction.isButton()) {
+    await handleConfigButton(interaction);
+    return true;
+  }
+
+  if (interaction.isStringSelectMenu()) {
+    await handleConfigStringSelect(interaction);
+    return true;
+  }
+
+  if (interaction.isUserSelectMenu()) {
+    await handleConfigUserSelect(interaction);
+    return true;
+  }
+
+  if (interaction.isChannelSelectMenu()) {
+    await handleConfigChannelSelect(interaction);
+    return true;
+  }
+
+  if (interaction.isModalSubmit()) {
+    await handleConfigModalSubmit(interaction);
+    return true;
+  }
+
+  return false;
+}
+
+async function handleConfigButton(interaction) {
+  const [, action, channelId] = interaction.customId.split(":");
+
+  if (action === "refresh") {
+    await interaction.update(buildConfigPanelPayload());
+    return;
+  }
+
+  if (action === "back") {
+    await interaction.update(buildConfigPanelPayload());
+    return;
+  }
+
+  if (action === "reload") {
+    await loadMonitoringConfig();
+    await interaction.update(buildConfigPanelPayload());
+    return;
+  }
+
+  if (action === "terms") {
+    assertWritableConfig();
+    const rule = monitoringConfig.channels[channelId];
+    const modal = new ModalBuilder()
+      .setCustomId(`${configUiPrefix}:terms-modal:${channelId}:${interaction.message.id}`)
+      .setTitle("Edit watched phrases")
+      .addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId("terms")
+            .setLabel("One keyword or phrase per line")
+            .setStyle(TextInputStyle.Paragraph)
+            .setRequired(false)
+            .setMaxLength(4000)
+            .setValue((rule?.terms || []).join("\n"))
+        )
+      );
+
+    await interaction.showModal(modal);
+    return;
+  }
+
+  assertWritableConfig();
+
+  if (action === "toggle-openai") {
+    const rule = getEditableChannelRule(channelId);
+    rule.analyzeWithOpenAI = !rule.analyzeWithOpenAI;
+    await saveMonitoringConfig();
+    await interaction.update(buildConfigPanelPayload(channelId));
+    return;
+  }
+
+  if (action === "toggle-forward-mention") {
+    const rule = getEditableChannelRule(channelId);
+    rule.mentionInForward = !rule.mentionInForward;
+    await saveMonitoringConfig();
+    await interaction.update(buildConfigPanelPayload(channelId));
+    return;
+  }
+
+  if (action === "remove") {
+    delete monitoringConfig.channels[channelId];
+    await saveMonitoringConfig();
+    await interaction.update(buildConfigPanelPayload());
+  }
+}
+
+async function handleConfigStringSelect(interaction) {
+  const [, action, channelId] = interaction.customId.split(":");
+
+  if (action === "select") {
+    await interaction.update(buildConfigPanelPayload(interaction.values[0]));
+    return;
+  }
+
+  assertWritableConfig();
+
+  if (action === "actions") {
+    const rule = getEditableChannelRule(channelId);
+    rule.actions = new Set(interaction.values);
+    await saveMonitoringConfig();
+    await interaction.update(buildConfigPanelPayload(channelId));
+  }
+}
+
+async function handleConfigUserSelect(interaction) {
+  const [, action, channelId] = interaction.customId.split(":");
+  if (action !== "users") return;
+
+  assertWritableConfig();
+  const rule = getEditableChannelRule(channelId);
+  rule.mentionUserIds = interaction.values;
+  await saveMonitoringConfig();
+  await interaction.update(buildConfigPanelPayload(channelId));
+}
+
+async function handleConfigChannelSelect(interaction) {
+  const [, action, channelId] = interaction.customId.split(":");
+
+  assertWritableConfig();
+
+  if (action === "add") {
+    const nextChannelId = interaction.values[0];
+
+    if (!monitoringConfig.channels[nextChannelId]) {
+      monitoringConfig.channels[nextChannelId] = {
+        actions: new Set(["mention", "forward"]),
+        terms: [],
+        mentionUserIds: [],
+        forwardChannelId: monitoringConfig.forwardChannelId || "",
+        mentionInForward: monitoringConfig.mentionInForward,
+        analyzeWithOpenAI: monitoringConfig.analyzeWithOpenAI
+      };
+    }
+
+    await saveMonitoringConfig();
+    await interaction.update(buildConfigPanelPayload(nextChannelId));
+    return;
+  }
+
+  if (action === "forward") {
+    const rule = getEditableChannelRule(channelId);
+    rule.forwardChannelId = interaction.values[0];
+    await saveMonitoringConfig();
+    await interaction.update(buildConfigPanelPayload(channelId));
+  }
+}
+
+async function handleConfigModalSubmit(interaction) {
+  const [, action, channelId, panelMessageId] = interaction.customId.split(":");
+  if (action !== "terms-modal") return;
+
+  assertWritableConfig();
+  const rule = getEditableChannelRule(channelId);
+  rule.terms = parseTextareaList(interaction.fields.getTextInputValue("terms"));
+  await saveMonitoringConfig();
+  await interaction.reply({
+    content: `Updated watched phrases for <#${channelId}>.`,
+    ephemeral: true
+  });
+  await refreshConfigPanelMessage(interaction, panelMessageId, channelId);
+}
+
+function buildConfigPanelPayload(selectedChannelId = "") {
+  const selectedRule = selectedChannelId ? monitoringConfig.channels[selectedChannelId] : null;
+
+  return {
+    embeds: [buildConfigPanelEmbed(selectedChannelId, selectedRule)],
+    components: buildConfigPanelComponents(selectedChannelId, selectedRule)
+  };
+}
+
+function buildConfigPanelEmbed(selectedChannelId, selectedRule) {
+  const writableText = isWritableConfig()
+    ? `Local file: \`${env.configFile}\``
+    : "Read-only: clear `MONITORING_CONFIG_URL` and set `MONITORING_CONFIG_FILE=data/monitoring.json` to edit from Discord.";
+  const channelIds = Object.keys(monitoringConfig.channels);
+  const embed = new EmbedBuilder()
+    .setColor(isWritableConfig() ? 0x2f80ed : 0xf5a524)
+    .setTitle("Discord Bot Configuration")
+    .setDescription([
+      writableText,
+      `Watched channels: ${channelIds.length}`,
+      `Default actions: ${formatActionList(monitoringConfig.actions)}`,
+      `Default OpenAI analysis: ${formatBoolean(monitoringConfig.analyzeWithOpenAI)}`
+    ].join("\n"))
+    .setTimestamp(new Date());
+
+  if (selectedChannelId && selectedRule) {
+    embed.addFields({
+      name: `Selected: #${selectedChannelId}`,
+      value: formatRuleSummary(selectedChannelId, selectedRule),
+      inline: false
+    });
+  } else if (channelIds.length === 0) {
+    embed.addFields({
+      name: "No monitored channels yet",
+      value: "Use the channel picker below to add the first channel.",
+      inline: false
+    });
+  } else {
+    for (const channelId of channelIds.slice(0, 10)) {
+      embed.addFields({
+        name: `#${channelId}`,
+        value: formatRuleSummary(channelId, monitoringConfig.channels[channelId]),
+        inline: false
+      });
+    }
+
+    if (channelIds.length > 10) {
+      embed.addFields({
+        name: "More channels",
+        value: `${channelIds.length - 10} additional channel(s) are configured.`,
+        inline: false
+      });
+    }
+  }
+
+  return embed;
+}
+
+function buildConfigPanelComponents(selectedChannelId, selectedRule) {
+  const rows = [];
+  const channelIds = Object.keys(monitoringConfig.channels);
+  const writable = isWritableConfig();
+
+  if (channelIds.length > 0) {
+    rows.push(
+      new ActionRowBuilder().addComponents(
+        new StringSelectMenuBuilder()
+          .setCustomId(`${configUiPrefix}:select`)
+          .setPlaceholder("Choose a monitored channel")
+          .addOptions(
+            channelIds.slice(0, maxConfigSelectOptions).map((channelId) => ({
+              label: `#${channelId}`,
+              description: truncatePlain(formatRuleDescription(monitoringConfig.channels[channelId]), 100),
+              value: channelId,
+              default: channelId === selectedChannelId
+            }))
+          )
+      )
+    );
+  }
+
+  if (!selectedRule) {
+    rows.push(
+      new ActionRowBuilder().addComponents(
+        new ChannelSelectMenuBuilder()
+          .setCustomId(`${configUiPrefix}:add`)
+          .setPlaceholder("Add a channel to monitor")
+          .setChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
+          .setDisabled(!writable)
+      )
+    );
+    rows.push(
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`${configUiPrefix}:refresh`)
+          .setLabel("Refresh")
+          .setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder()
+          .setCustomId(`${configUiPrefix}:reload`)
+          .setLabel("Reload File")
+          .setStyle(ButtonStyle.Secondary)
+      )
+    );
+    return rows;
+  }
+
+  rows.push(
+    new ActionRowBuilder().addComponents(
+      new StringSelectMenuBuilder()
+        .setCustomId(`${configUiPrefix}:actions:${selectedChannelId}`)
+        .setPlaceholder("Choose actions")
+        .setMinValues(1)
+        .setMaxValues(2)
+        .setDisabled(!writable)
+        .addOptions(
+          {
+            label: "Mention in source channel",
+            value: "mention",
+            default: selectedRule.actions.has("mention")
+          },
+          {
+            label: "Forward alert to another channel",
+            value: "forward",
+            default: selectedRule.actions.has("forward")
+          }
+        )
+    )
+  );
+
+  rows.push(
+    new ActionRowBuilder().addComponents(
+      new UserSelectMenuBuilder()
+        .setCustomId(`${configUiPrefix}:users:${selectedChannelId}`)
+        .setPlaceholder("Choose users to notify")
+        .setMinValues(0)
+        .setMaxValues(10)
+        .setDisabled(!writable)
+    )
+  );
+
+  rows.push(
+    new ActionRowBuilder().addComponents(
+      new ChannelSelectMenuBuilder()
+        .setCustomId(`${configUiPrefix}:forward:${selectedChannelId}`)
+        .setPlaceholder("Choose forwarding channel")
+        .setChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
+        .setDisabled(!writable)
+    )
+  );
+
+  rows.push(
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`${configUiPrefix}:terms:${selectedChannelId}`)
+        .setLabel("Keywords")
+        .setStyle(ButtonStyle.Primary)
+        .setDisabled(!writable),
+      new ButtonBuilder()
+        .setCustomId(`${configUiPrefix}:toggle-openai:${selectedChannelId}`)
+        .setLabel(selectedRule.analyzeWithOpenAI ? "OpenAI On" : "OpenAI Off")
+        .setStyle(selectedRule.analyzeWithOpenAI ? ButtonStyle.Success : ButtonStyle.Secondary)
+        .setDisabled(!writable),
+      new ButtonBuilder()
+        .setCustomId(`${configUiPrefix}:toggle-forward-mention:${selectedChannelId}`)
+        .setLabel(selectedRule.mentionInForward ? "Alert Tag On" : "Alert Tag Off")
+        .setStyle(selectedRule.mentionInForward ? ButtonStyle.Success : ButtonStyle.Secondary)
+        .setDisabled(!writable),
+      new ButtonBuilder()
+        .setCustomId(`${configUiPrefix}:remove:${selectedChannelId}`)
+        .setLabel("Remove")
+        .setStyle(ButtonStyle.Danger)
+        .setDisabled(!writable),
+      new ButtonBuilder()
+        .setCustomId(`${configUiPrefix}:back`)
+        .setLabel("Back")
+        .setStyle(ButtonStyle.Secondary)
+    )
+  );
+
+  return rows.slice(0, 5);
+}
+
+function isInteractionAuthorized(interaction) {
+  const commandUserIds = monitoringConfig.commandUserIds || [];
+
+  if (commandUserIds.includes(interaction.user.id)) {
+    return true;
+  }
+
+  if (commandUserIds.length > 0) {
+    return false;
+  }
+
+  return Boolean(interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild));
+}
+
+function isWritableConfig() {
+  return !env.configUrl;
+}
+
+function assertWritableConfig() {
+  if (isWritableConfig()) return;
+
+  throw new Error(
+    "Discord config editing is disabled while MONITORING_CONFIG_URL is set. Remove that value and set MONITORING_CONFIG_FILE=data/monitoring.json on Lightsail."
+  );
+}
+
+function getEditableChannelRule(channelId) {
+  const rule = monitoringConfig.channels[channelId];
+
+  if (!rule) {
+    throw new Error(`No monitored channel found for ${channelId}.`);
+  }
+
+  return rule;
+}
+
+async function refreshConfigPanelMessage(interaction, messageId, selectedChannelId) {
+  if (!messageId || !interaction.channel?.messages?.fetch) return;
+
+  const panelMessage = await interaction.channel.messages.fetch(messageId);
+  await panelMessage.edit(buildConfigPanelPayload(selectedChannelId));
+}
+
+async function replyToInteractionError(interaction, error) {
+  if (!interaction.isRepliable()) return;
+
+  const content = `Config action failed: ${error.message}`;
+
+  if (interaction.deferred || interaction.replied) {
+    await interaction.followUp({ content, ephemeral: true });
+    return;
+  }
+
+  await interaction.reply({ content, ephemeral: true });
+}
+
+function parseTextareaList(value) {
+  return uniqueList(
+    String(value || "")
+      .split(/[\n,]/)
+      .map((item) => item.replace(/^[-*]\s*/, "").trim())
+      .filter(Boolean)
+  );
+}
+
+function formatRuleSummary(channelId, rule) {
+  return [
+    `Actions: ${formatActionList(rule.actions)}`,
+    `Keywords: ${formatDisplayList(rule.terms)}`,
+    `Notify: ${formatUserList(rule.mentionUserIds)}`,
+    `Forward: ${rule.forwardChannelId ? `<#${rule.forwardChannelId}>` : "none"}`,
+    `Mention in alert channel: ${formatBoolean(rule.mentionInForward)}`,
+    `OpenAI analysis: ${formatBoolean(rule.analyzeWithOpenAI)}`
+  ].join("\n");
+}
+
+function formatRuleDescription(rule) {
+  return [
+    formatActionList(rule.actions),
+    rule.terms.length > 0 ? rule.terms.join(", ") : "no keywords"
+  ].join(" | ");
+}
+
+function formatActionList(actions) {
+  return [...actions].join(", ") || "none";
+}
+
+function formatDisplayList(values) {
+  return values.length > 0 ? truncatePlain(values.join(", "), 700) : "none";
+}
+
+function formatUserList(userIds) {
+  return userIds.length > 0 ? userIds.map((userId) => `<@${userId}>`).join(", ") : "none";
+}
+
+function formatBoolean(value) {
+  return value ? "on" : "off";
+}
+
+function truncatePlain(value, maxLength) {
+  if (!value) return "";
+  if (value.length <= maxLength) return value;
+  return `${value.slice(0, maxLength - 3)}...`;
+}
+
 function getMentionUserIds(channelRule) {
   return channelRule.mentionUserIds.length > 0
     ? channelRule.mentionUserIds
@@ -554,6 +1073,7 @@ async function forwardAlert(
   matchedTerms,
   mentionUserIds,
   forwardChannelId,
+  mentionInForward,
   searchableText
 ) {
   if (!forwardChannelId) return;
@@ -598,7 +1118,7 @@ async function forwardAlert(
     )
     .setTimestamp(message.createdAt);
 
-  const mentionContent = monitoringConfig.mentionInForward && mentionUserIds.length > 0
+  const mentionContent = mentionInForward && mentionUserIds.length > 0
     ? formatMentions(mentionUserIds)
     : undefined;
 
@@ -606,7 +1126,7 @@ async function forwardAlert(
     content: mentionContent,
     embeds: [embed],
     allowedMentions: {
-      users: monitoringConfig.mentionInForward ? mentionUserIds : []
+      users: mentionInForward ? mentionUserIds : []
     }
   });
 }
@@ -625,20 +1145,52 @@ function truncate(value, maxLength) {
 
 async function loadMonitoringConfig() {
   try {
-    const nextConfig = env.configUrl
-      ? normalizeMonitoringConfig(await fetchMonitoringConfig(env.configUrl))
-      : normalizeMonitoringConfig(JSON.parse(await readFile(env.configFile, "utf8")));
+    const configData = env.configUrl
+      ? await fetchMonitoringConfig(env.configUrl)
+      : await readLocalMonitoringConfig();
+    const nextConfig = normalizeMonitoringConfig(configData);
 
     monitoringConfig = nextConfig;
     console.log("Monitoring config loaded.");
   } catch (error) {
-    if (error.code === "ENOENT" && !env.configUrl) {
-      console.log("No monitoring config file found; using .env monitoring settings.");
-      return;
-    }
-
     console.error("Failed to load monitoring config; keeping previous settings:", error);
   }
+}
+
+async function readLocalMonitoringConfig() {
+  try {
+    return JSON.parse(await readFile(env.configFile, "utf8"));
+  } catch (error) {
+    if (error.code !== "ENOENT") {
+      throw error;
+    }
+
+    const seedConfig = await readSeedMonitoringConfig();
+    await mkdir(dirname(env.configFile), { recursive: true });
+    await writeFile(env.configFile, `${JSON.stringify(seedConfig, null, 2)}\n`);
+    console.log(`Created local monitoring config at ${env.configFile}.`);
+    return seedConfig;
+  }
+}
+
+async function readSeedMonitoringConfig() {
+  if (env.configFile !== "config/monitoring.json") {
+    try {
+      return JSON.parse(await readFile("config/monitoring.json", "utf8"));
+    } catch (error) {
+      if (error.code !== "ENOENT") {
+        throw error;
+      }
+    }
+  }
+
+  return serializeMonitoringConfig(buildEnvMonitoringConfig());
+}
+
+async function saveMonitoringConfig() {
+  assertWritableConfig();
+  await mkdir(dirname(env.configFile), { recursive: true });
+  await writeFile(env.configFile, `${JSON.stringify(serializeMonitoringConfig(), null, 2)}\n`);
 }
 
 async function fetchMonitoringConfig(url) {
@@ -672,8 +1224,10 @@ function buildEnvMonitoringConfig() {
       rule.channelId,
       {
         terms: rule.terms,
+        actions: [...env.alertActions],
         mentionUserIds: channelMentionsById.get(rule.channelId) || [],
         forwardChannelId: env.forwardChannelId || "",
+        mentionInForward: env.mentionInForward,
         analyzeWithOpenAI: true
       }
     ])
@@ -693,37 +1247,68 @@ function buildEnvMonitoringConfig() {
 
 function normalizeMonitoringConfig(config) {
   const normalizedChannels = {};
+  const actions = parseActionList(
+    config.actions || config.alertActions || [...env.alertActions],
+    "monitoring config actions"
+  );
+  const defaultAnalyzeWithOpenAI = parseConfigBoolean(config.analyzeWithOpenAI, true);
+  const defaultMentionInForward = parseConfigBoolean(config.mentionInForward, env.mentionInForward);
 
   for (const [channelId, channelConfig] of Object.entries(config.channels || {})) {
-    const defaultAnalyzeWithOpenAI = parseConfigBoolean(config.analyzeWithOpenAI, true);
+    const channelActions = parseActionList(
+      channelConfig.actions || channelConfig.alertActions || actions,
+      `actions for channel ${channelId}`
+    );
 
     normalizedChannels[channelId] = {
+      actions: new Set(channelActions),
       terms: parseStringList(channelConfig.terms || channelConfig.watchTerms),
       mentionUserIds: parseStringList(channelConfig.mentionUserIds || channelConfig.mentionUserId),
       forwardChannelId: String(channelConfig.forwardChannelId || config.forwardChannelId || ""),
+      mentionInForward: parseConfigBoolean(channelConfig.mentionInForward, defaultMentionInForward),
       analyzeWithOpenAI: parseConfigBoolean(channelConfig.analyzeWithOpenAI, defaultAnalyzeWithOpenAI)
     };
   }
 
-  const actions = parseStringList(config.actions || config.alertActions || [...env.alertActions]);
-
-  for (const action of actions) {
-    if (!["mention", "forward"].includes(action)) {
-      throw new Error(`Unsupported monitoring config action: ${action}`);
-    }
-  }
-
   return {
     actions: new Set(actions),
-    analyzeWithOpenAI: parseConfigBoolean(config.analyzeWithOpenAI, true),
+    analyzeWithOpenAI: defaultAnalyzeWithOpenAI,
     channels: normalizedChannels,
     commandPrefix: String(config.commandPrefix || "!monitor"),
     commandUserIds: parseStringList(config.commandUserIds || config.commandUserId || []),
     defaultTerms: parseStringList(config.defaultTerms || config.watchTerms || env.watchTerms),
     forwardChannelId: String(config.forwardChannelId || env.forwardChannelId || ""),
-    mentionInForward: Boolean(config.mentionInForward ?? env.mentionInForward),
+    mentionInForward: defaultMentionInForward,
     mentionUserIds: parseStringList(config.mentionUserIds || config.mentionUserId || env.mentionUserIds),
     monitoredChannelIds: parseStringList(config.monitoredChannelIds || env.monitoredChannelIds)
+  };
+}
+
+function serializeMonitoringConfig(config = monitoringConfig) {
+  const channels = {};
+
+  for (const [channelId, rule] of Object.entries(config.channels || {})) {
+    channels[channelId] = {
+      actions: [...rule.actions],
+      terms: rule.terms,
+      mentionUserIds: rule.mentionUserIds,
+      forwardChannelId: rule.forwardChannelId,
+      mentionInForward: rule.mentionInForward,
+      analyzeWithOpenAI: rule.analyzeWithOpenAI
+    };
+  }
+
+  return {
+    actions: [...config.actions],
+    analyzeWithOpenAI: config.analyzeWithOpenAI,
+    commandPrefix: config.commandPrefix,
+    commandUserIds: config.commandUserIds,
+    defaultTerms: config.defaultTerms,
+    forwardChannelId: config.forwardChannelId,
+    mentionInForward: config.mentionInForward,
+    mentionUserIds: config.mentionUserIds,
+    monitoredChannelIds: config.monitoredChannelIds,
+    channels
   };
 }
 

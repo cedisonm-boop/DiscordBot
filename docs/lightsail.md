@@ -35,7 +35,8 @@ Fill in:
 DISCORD_TOKEN=
 OPENAI_API_KEY=
 OPENAI_MODEL=gpt-5.5
-MONITORING_CONFIG_URL=https://raw.githubusercontent.com/cedisonm-boop/DiscordBot/main/config/monitoring.json
+MONITORING_CONFIG_FILE=data/monitoring.json
+MONITORING_CONFIG_URL=
 MONITORING_CONFIG_REFRESH_SECONDS=300
 CHANNEL_RULES=
 CHANNEL_MENTION_USER_IDS=
@@ -97,9 +98,23 @@ sudo systemctl restart discord-openai-bot
 
 Never commit `.env` to GitHub. It contains your Discord token and OpenAI API key.
 
-## Editing Routing Without SSH
+## Editing Routing From Discord
 
-For normal channel/user/keyword changes, edit `config/monitoring.json` in GitHub. The bot reloads `MONITORING_CONFIG_URL` every 5 minutes by default.
+Create a private Discord channel such as `#BotConfiguration`, then post:
+
+```text
+!monitor panel
+```
+
+The bot will post an interactive panel that edits the live Lightsail config at `data/monitoring.json`. Use the panel to add/select monitored channels, edit keywords, choose users to notify, choose a forwarding channel, choose actions, and toggle OpenAI analysis.
+
+Leave `MONITORING_CONFIG_URL` empty. If it is set, the panel becomes read-only because remote URL config would overwrite local UI edits.
+
+GitHub stays for code changes. Routine channel/user/keyword routing belongs in the Discord panel.
+
+## Config File Shape
+
+The live config file is `data/monitoring.json`. The setup script seeds it from `config/monitoring.json` the first time it runs.
 
 Use this shape:
 
@@ -116,16 +131,27 @@ Use this shape:
   "monitoredChannelIds": [],
   "channels": {
     "CHANNEL_ID_TO_WATCH": {
+      "actions": ["mention", "forward"],
       "terms": ["refund", "chargeback", "payment"],
       "mentionUserIds": ["USER_ID_TO_TAG"],
       "forwardChannelId": "ALERT_CHANNEL_ID",
+      "mentionInForward": true,
       "analyzeWithOpenAI": false
+    },
+    "ANOTHER_CHANNEL_ID_TO_WATCH": {
+      "actions": ["forward"],
+      "terms": ["security", "password", "login"],
+      "forwardChannelId": "DIFFERENT_ALERT_CHANNEL_ID",
+      "mentionInForward": false,
+      "analyzeWithOpenAI": true
     }
   }
 }
 ```
 
 Set `"analyzeWithOpenAI": false` for keyword-only testing. Set it to `true` when you want OpenAI analysis to decide whether a matched message should alert.
+
+Channel-level settings override the top-level defaults, so each monitored channel can have different keywords, tagged users, forwarding destinations, OpenAI behavior, and actions.
 
 The bot reads normal message text and Discord embed text, so webhook/app posts from tools like OneStopSocial can be matched too.
 
@@ -135,6 +161,7 @@ In Discord, use these commands to make the bot scan recent message history:
 
 ```text
 !monitor status
+!monitor panel
 !monitor reload
 !monitor backfill 50
 !monitor backfill 1515161469954818098 100

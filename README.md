@@ -22,20 +22,44 @@ npm start
 
 ## Configuration
 
-For easiest cloud use, keep secrets in Lightsail `.env` and edit channel routing in [config/monitoring.json](config/monitoring.json) on GitHub.
+For easiest cloud use, keep secrets in Lightsail `.env` and let the Discord configuration panel edit the live routing file at `data/monitoring.json`.
 
 Set this once in Lightsail `.env`:
 
 ```bash
-MONITORING_CONFIG_URL=https://raw.githubusercontent.com/cedisonm-boop/DiscordBot/main/config/monitoring.json
+MONITORING_CONFIG_FILE=data/monitoring.json
+MONITORING_CONFIG_URL=
 MONITORING_CONFIG_REFRESH_SECONDS=300
 ```
 
-Then edit `config/monitoring.json` in GitHub whenever you need to change watched channels, keywords, tagged users, or forwarding channels. The bot reloads it automatically every 5 minutes by default.
+GitHub stays for code changes. Routine monitored-channel, keyword, tagged-user, and forwarding-channel changes should be made from Discord with `!monitor panel`.
 
 Set `"analyzeWithOpenAI": false` for keyword-only testing. In that mode, matching terms trigger alerts without calling OpenAI.
 
 The bot reads normal message text plus Discord embed text, including webhook/app posts with embed titles, descriptions, fields, footers, and authors.
+
+Each channel can have its own trigger terms, tagged users, forwarding channel, and actions:
+
+```json
+{
+  "channels": {
+    "CHANNEL_ID_TO_WATCH": {
+      "actions": ["mention", "forward"],
+      "terms": ["looking for accommodation", "looking to rent"],
+      "mentionUserIds": ["USER_ID_TO_TAG"],
+      "forwardChannelId": "ALERT_CHANNEL_ID",
+      "mentionInForward": true,
+      "analyzeWithOpenAI": false
+    },
+    "ANOTHER_CHANNEL_ID_TO_WATCH": {
+      "actions": ["forward"],
+      "terms": ["refund", "chargeback"],
+      "forwardChannelId": "DIFFERENT_ALERT_CHANNEL_ID",
+      "analyzeWithOpenAI": true
+    }
+  }
+}
+```
 
 `MONITORED_CHANNEL_IDS` controls which Discord channels are watched. Use comma-separated channel IDs, or leave it blank to watch every text channel the bot can access.
 
@@ -59,7 +83,7 @@ CHANNEL_MENTION_USER_IDS=111111111111111111:333333333333333333|44444444444444444
 
 When `CHANNEL_MENTION_USER_IDS` is set for a channel, it overrides `MENTION_USER_ID` and `MENTION_USER_IDS` for that channel.
 
-`ALERT_ACTIONS` controls what happens after OpenAI decides a message needs attention:
+`ALERT_ACTIONS` controls the default behavior after OpenAI decides a message needs attention. In `data/monitoring.json`, each channel can override this with its own `actions` list:
 
 - `mention` posts a mention for the configured user ID(s) in the source channel.
 - `forward` posts an alert in `FORWARD_CHANNEL_ID`.
@@ -71,10 +95,13 @@ The default command prefix is `!monitor`. Users listed in `commandUserIds` can r
 
 ```text
 !monitor status
+!monitor panel
 !monitor reload
 !monitor backfill 50
 !monitor backfill 1515161469954818098 100
 ```
+
+Post `!monitor panel` in your private `#BotConfiguration` channel to show the interactive configuration UI. The panel can add/select monitored channels, edit keywords, choose users to notify, choose a forwarding channel, choose actions, and toggle OpenAI analysis.
 
 `backfill` manually scans recent message history. Discord allows up to 100 recent messages per fetch.
 

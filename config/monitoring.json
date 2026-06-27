@@ -10,6 +10,7 @@
   "monitoredChannelIds": [],
   "channels": {
     "1515161469954818098": {
+      "actions": ["mention", "forward"],
       "terms": [
         "looking for accommodation",
         "looking to rent",
@@ -17,6 +18,7 @@
       ],
       "mentionUserIds": ["1301533439224451103"],
       "forwardChannelId": "1520512853361037342",
+      "mentionInForward": true,
       "analyzeWithOpenAI": false
     }
   }
