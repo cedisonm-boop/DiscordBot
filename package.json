@@ -1,0 +1,20 @@
+{
+  "name": "discord-openai-channel-monitor",
+  "version": "0.1.0",
+  "description": "Discord bot that watches selected channels, analyzes matching messages with OpenAI, then mentions a user and/or forwards the alert.",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "check": "node --check src/index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.7",
+    "openai": "latest",
+    "zod": "^3.24.1"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
