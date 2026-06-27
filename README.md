@@ -35,6 +35,8 @@ Then edit `config/monitoring.json` in GitHub whenever you need to change watched
 
 Set `"analyzeWithOpenAI": false` for keyword-only testing. In that mode, matching terms trigger alerts without calling OpenAI.
 
+The bot reads normal message text plus Discord embed text, including webhook/app posts with embed titles, descriptions, fields, footers, and authors.
+
 `MONITORED_CHANNEL_IDS` controls which Discord channels are watched. Use comma-separated channel IDs, or leave it blank to watch every text channel the bot can access.
 
 `WATCH_TERMS` controls the first filter. If any term appears in a message, the bot sends the message to OpenAI for analysis. Leave it blank to analyze every message in monitored channels.
@@ -63,11 +65,24 @@ When `CHANNEL_MENTION_USER_IDS` is set for a channel, it overrides `MENTION_USER
 - `forward` posts an alert in `FORWARD_CHANNEL_ID`.
 - Use both as `mention,forward`.
 
+## Discord Commands
+
+The default command prefix is `!monitor`. Users listed in `commandUserIds` can run commands. If `commandUserIds` is empty, users with Discord **Manage Server** permission can run them.
+
+```text
+!monitor status
+!monitor reload
+!monitor backfill 50
+!monitor backfill 1515161469954818098 100
+```
+
+`backfill` manually scans recent message history. Discord allows up to 100 recent messages per fetch.
+
 ## Notes
 
 Keep `.env` private. It contains both your Discord token and OpenAI API key.
 
-The bot ignores messages from other bots to avoid loops.
+The bot ignores its own messages to avoid loops, but it can process webhook/app messages from tools like OneStopSocial.
 
 ## Cloud Deployment
 

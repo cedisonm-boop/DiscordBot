@@ -107,6 +107,8 @@ Use this shape:
 {
   "actions": ["mention", "forward"],
   "analyzeWithOpenAI": false,
+  "commandPrefix": "!monitor",
+  "commandUserIds": [],
   "defaultTerms": ["urgent", "refund", "chargeback", "security"],
   "forwardChannelId": "ALERT_CHANNEL_ID",
   "mentionInForward": false,
@@ -124,5 +126,22 @@ Use this shape:
 ```
 
 Set `"analyzeWithOpenAI": false` for keyword-only testing. Set it to `true` when you want OpenAI analysis to decide whether a matched message should alert.
+
+The bot reads normal message text and Discord embed text, so webhook/app posts from tools like OneStopSocial can be matched too.
+
+## Manual Backfill Commands
+
+In Discord, use these commands to make the bot scan recent message history:
+
+```text
+!monitor status
+!monitor reload
+!monitor backfill 50
+!monitor backfill 1515161469954818098 100
+```
+
+`!monitor backfill 50` scans the configured source channel(s), up to 50 recent messages per channel. `!monitor backfill 1515161469954818098 100` scans one specific channel, up to Discord's 100-message fetch limit.
+
+Users listed in `commandUserIds` can run commands. If `commandUserIds` is empty, users with Discord **Manage Server** permission can run them.
 
 Discord tokens and OpenAI API keys still belong only in Lightsail `.env`, never in GitHub.

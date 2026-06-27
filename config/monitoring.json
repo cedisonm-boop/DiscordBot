@@ -1,6 +1,8 @@
 {
   "actions": ["mention", "forward"],
   "analyzeWithOpenAI": false,
+  "commandPrefix": "!monitor",
+  "commandUserIds": [],
   "defaultTerms": [],
   "forwardChannelId": "1520512853361037342",
   "mentionInForward": true,

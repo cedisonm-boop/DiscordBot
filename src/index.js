@@ -2,7 +2,7 @@ import "dotenv/config";
 
 import { readFile } from "node:fs/promises";
 
-import { Client, EmbedBuilder, Events, GatewayIntentBits } from "discord.js";
+import { Client, EmbedBuilder, Events, GatewayIntentBits, PermissionFlagsBits } from "discord.js";
 import OpenAI from "openai";
 import { zodTextFormat } from "openai/helpers/zod";
 import { z } from "zod";
@@ -39,6 +39,8 @@ const client = new Client({
     GatewayIntentBits.MessageContent
   ]
 });
+const processedMessageIds = new Set();
+const maxRememberedMessageIds = 2000;
 
 const AnalysisResult = z.object({
   shouldAlert: z.boolean().describe("True only when the message should be acted on."),
@@ -57,20 +59,10 @@ startConfigRefresh();
 
 client.on(Events.MessageCreate, async (message) => {
   try {
-    if (message.author.bot) return;
+    if (message.author.id === client.user?.id) return;
+    if (await handleMonitorCommand(message)) return;
 
-    const channelRule = getChannelRule(message.channelId);
-    if (!channelRule) return;
-
-    const matchedTerms = getMatchedTerms(message.content, channelRule.terms);
-    if (channelRule.terms.length > 0 && matchedTerms.length === 0) return;
-
-    const analysis = channelRule.analyzeWithOpenAI
-      ? await analyzeMessage(message, matchedTerms, channelRule.terms)
-      : buildKeywordOnlyAnalysis(matchedTerms);
-    if (!analysis.shouldAlert) return;
-
-    await runAlertActions(message, analysis, matchedTerms, channelRule);
+    await processCandidateMessage(message, { source: "live" });
   } catch (error) {
     console.error("Failed to process message:", error);
   }
@@ -189,12 +181,104 @@ function getChannelRule(channelId) {
   };
 }
 
+async function processCandidateMessage(message, { source = "live" } = {}) {
+  if (message.author.id === client.user?.id) {
+    return { matched: false, alerted: false };
+  }
+
+  if (isMonitorCommandMessage(message)) {
+    return { matched: false, alerted: false };
+  }
+
+  const channelRule = getChannelRule(message.channelId);
+  if (!channelRule) {
+    return { matched: false, alerted: false };
+  }
+
+  const searchableText = getSearchableMessageText(message);
+  if (!searchableText) {
+    return { matched: false, alerted: false };
+  }
+
+  const matchedTerms = getMatchedTerms(searchableText, channelRule.terms);
+  if (channelRule.terms.length > 0 && matchedTerms.length === 0) {
+    return { matched: false, alerted: false };
+  }
+
+  if (processedMessageIds.has(message.id)) {
+    return { matched: true, alerted: false };
+  }
+
+  const analysis = channelRule.analyzeWithOpenAI
+    ? await analyzeMessage(message, matchedTerms, channelRule.terms, searchableText, source)
+    : buildKeywordOnlyAnalysis(matchedTerms);
+
+  rememberProcessedMessage(message.id);
+
+  if (!analysis.shouldAlert) {
+    return { matched: true, alerted: false };
+  }
+
+  await runAlertActions(message, analysis, matchedTerms, channelRule, searchableText);
+  return { matched: true, alerted: true };
+}
+
+function rememberProcessedMessage(messageId) {
+  processedMessageIds.add(messageId);
+
+  if (processedMessageIds.size <= maxRememberedMessageIds) {
+    return;
+  }
+
+  const oldestMessageId = processedMessageIds.values().next().value;
+  processedMessageIds.delete(oldestMessageId);
+}
+
+function getSearchableMessageText(message) {
+  const parts = [];
+
+  appendTextPart(parts, message.content);
+
+  for (const embed of message.embeds || []) {
+    appendTextPart(parts, embed.author?.name);
+    appendTextPart(parts, embed.title);
+    appendTextPart(parts, embed.description);
+
+    for (const field of embed.fields || []) {
+      appendTextPart(parts, field.name);
+      appendTextPart(parts, field.value);
+    }
+
+    appendTextPart(parts, embed.footer?.text);
+  }
+
+  for (const attachment of message.attachments?.values?.() || []) {
+    appendTextPart(parts, attachment.name);
+    appendTextPart(parts, attachment.description);
+  }
+
+  return parts.join("\n").trim();
+}
+
+function appendTextPart(parts, value) {
+  if (typeof value !== "string") return;
+
+  const trimmed = value.trim();
+  if (trimmed) parts.push(trimmed);
+}
+
+function isMonitorCommandMessage(message) {
+  const prefix = monitoringConfig.commandPrefix;
+
+  return Boolean(prefix && message.content?.trim().startsWith(prefix));
+}
+
 function getMatchedTerms(content, terms) {
-  const lowerContent = content.toLowerCase();
+  const lowerContent = String(content || "").toLowerCase();
   return terms.filter((term) => lowerContent.includes(term.toLowerCase()));
 }
 
-async function analyzeMessage(message, matchedTerms, watchedTerms) {
+async function analyzeMessage(message, matchedTerms, watchedTerms, searchableText, source) {
   const response = await openai.responses.parse({
     model: env.openAiModel,
     reasoning: { effort: "low" },
@@ -213,9 +297,10 @@ async function analyzeMessage(message, matchedTerms, watchedTerms) {
         content: JSON.stringify({
           author: message.author.tag,
           channelId: message.channelId,
+          source,
           matchedTerms,
           watchedTerms,
-          message: message.content
+          message: searchableText
         })
       }
     ],
@@ -236,12 +321,14 @@ function buildKeywordOnlyAnalysis(matchedTerms) {
     shouldAlert: true,
     priority: "medium",
     category: "keyword-match",
-    summary: `Matched watched term(s): ${matchedTerms.join(", ")}`,
+    summary: matchedTerms.length > 0
+      ? `Matched watched term(s): ${matchedTerms.join(", ")}`
+      : "No keyword filter configured.",
     reason: "OpenAI analysis is disabled for this rule, so this alert was triggered by keyword matching only."
   };
 }
 
-async function runAlertActions(message, analysis, matchedTerms, channelRule) {
+async function runAlertActions(message, analysis, matchedTerms, channelRule, searchableText) {
   const mentionUserIds = getMentionUserIds(channelRule);
 
   if (monitoringConfig.actions.has("mention")) {
@@ -249,8 +336,191 @@ async function runAlertActions(message, analysis, matchedTerms, channelRule) {
   }
 
   if (monitoringConfig.actions.has("forward")) {
-    await forwardAlert(message, analysis, matchedTerms, mentionUserIds, channelRule.forwardChannelId);
+    await forwardAlert(
+      message,
+      analysis,
+      matchedTerms,
+      mentionUserIds,
+      channelRule.forwardChannelId,
+      searchableText
+    );
   }
+}
+
+async function handleMonitorCommand(message) {
+  const prefix = monitoringConfig.commandPrefix;
+  const content = message.content?.trim();
+
+  if (!prefix || !content?.startsWith(prefix)) {
+    return false;
+  }
+
+  if (!isCommandAuthorized(message)) {
+    await message.reply(
+      "You are not allowed to run monitor commands. Add your Discord user ID to `commandUserIds`, or use an account with Manage Server permission."
+    );
+    return true;
+  }
+
+  const rest = content.slice(prefix.length).trim();
+  const [command = "help", ...args] = rest.split(/\s+/).filter(Boolean);
+  const normalizedCommand = command.toLowerCase();
+
+  if (["help", "commands"].includes(normalizedCommand)) {
+    await message.reply(buildCommandHelp(prefix));
+    return true;
+  }
+
+  if (normalizedCommand === "status") {
+    await message.reply(buildCommandStatus());
+    return true;
+  }
+
+  if (normalizedCommand === "reload") {
+    await loadMonitoringConfig();
+    await message.reply("Monitoring config reload requested.");
+    return true;
+  }
+
+  if (["backfill", "scan"].includes(normalizedCommand)) {
+    await runBackfillCommand(message, args);
+    return true;
+  }
+
+  await message.reply(`Unknown monitor command. Try \`${prefix} help\`.`);
+  return true;
+}
+
+function isCommandAuthorized(message) {
+  const commandUserIds = monitoringConfig.commandUserIds || [];
+
+  if (commandUserIds.includes(message.author.id)) {
+    return true;
+  }
+
+  if (commandUserIds.length > 0) {
+    return false;
+  }
+
+  return Boolean(message.member?.permissions?.has(PermissionFlagsBits.ManageGuild));
+}
+
+function buildCommandHelp(prefix) {
+  return [
+    "Monitor commands:",
+    `\`${prefix} status\` - show active routing.`,
+    `\`${prefix} reload\` - reload GitHub monitoring config now.`,
+    `\`${prefix} backfill [limit]\` - scan recent messages in configured channels.`,
+    `\`${prefix} backfill <channelId> [limit]\` - scan one channel.`,
+    "Limit can be 1 to 100 because Discord only returns up to 100 messages per request."
+  ].join("\n");
+}
+
+function buildCommandStatus() {
+  const configuredChannelIds = getConfiguredBackfillChannelIds();
+  const commandUsers = monitoringConfig.commandUserIds.length > 0
+    ? monitoringConfig.commandUserIds.map((userId) => `<@${userId}>`).join(", ")
+    : "users with Manage Server permission";
+
+  return [
+    "Monitor is running.",
+    `Command prefix: \`${monitoringConfig.commandPrefix}\``,
+    `Configured source channels: ${configuredChannelIds.length > 0 ? configuredChannelIds.map((channelId) => `<#${channelId}>`).join(", ") : "default/global channels"}`,
+    `Actions: ${[...monitoringConfig.actions].join(", ") || "none"}`,
+    `Default OpenAI analysis: ${monitoringConfig.analyzeWithOpenAI ? "on" : "off"}`,
+    `Command access: ${commandUsers}`
+  ].join("\n");
+}
+
+async function runBackfillCommand(message, args) {
+  const { channelIds, limit } = parseBackfillRequest(args, message.channelId);
+
+  if (channelIds.length === 0) {
+    await message.reply("No channels are configured for backfill.");
+    return;
+  }
+
+  await message.reply(
+    `Backfill started for ${channelIds.length} channel(s), up to ${limit} recent message(s) each.`
+  );
+
+  const report = {
+    scanned: 0,
+    matched: 0,
+    alerted: 0,
+    errors: []
+  };
+
+  for (const channelId of channelIds) {
+    try {
+      const channel = await client.channels.fetch(channelId);
+
+      if (!channel?.isTextBased() || !channel.messages?.fetch) {
+        throw new Error("Channel is not a readable text channel.");
+      }
+
+      const fetchedMessages = await channel.messages.fetch({ limit });
+      const messages = [...fetchedMessages.values()].sort(
+        (a, b) => a.createdTimestamp - b.createdTimestamp
+      );
+
+      for (const oldMessage of messages) {
+        if (isMonitorCommandMessage(oldMessage)) continue;
+
+        report.scanned += 1;
+        const result = await processCandidateMessage(oldMessage, { source: "backfill" });
+
+        if (result.matched) report.matched += 1;
+        if (result.alerted) report.alerted += 1;
+      }
+    } catch (error) {
+      report.errors.push(`<#${channelId}>: ${error.message}`);
+      console.error(`Backfill failed for channel ${channelId}:`, error);
+    }
+  }
+
+  const lines = [
+    `Backfill complete. Scanned ${report.scanned} message(s), matched ${report.matched}, sent ${report.alerted} alert(s).`
+  ];
+
+  if (report.errors.length > 0) {
+    lines.push(`Errors: ${truncate(report.errors.join("; "), 1500)}`);
+  }
+
+  await message.reply(lines.join("\n"));
+}
+
+function parseBackfillRequest(args, fallbackChannelId) {
+  const configuredChannelIds = getConfiguredBackfillChannelIds();
+  let channelIds = configuredChannelIds.length > 0 ? configuredChannelIds : [fallbackChannelId];
+  let limit = 50;
+  const possibleChannelId = extractDiscordId(args[0]);
+
+  if (possibleChannelId) {
+    channelIds = [possibleChannelId];
+    limit = Number(args[1] || limit);
+  } else if (args[0]) {
+    limit = Number(args[0]);
+  }
+
+  return {
+    channelIds: uniqueList(channelIds),
+    limit: clampFetchLimit(limit)
+  };
+}
+
+function getConfiguredBackfillChannelIds() {
+  const channelIds = Object.keys(monitoringConfig.channels);
+  return channelIds.length > 0 ? channelIds : monitoringConfig.monitoredChannelIds;
+}
+
+function extractDiscordId(value) {
+  return String(value || "").match(/\d{17,20}/)?.[0] || "";
+}
+
+function clampFetchLimit(value) {
+  const limit = Number.isFinite(value) ? Math.trunc(value) : 50;
+  return Math.max(1, Math.min(limit, 100));
 }
 
 function getMentionUserIds(channelRule) {
@@ -278,7 +548,14 @@ async function mentionUserInSourceChannel(message, analysis, mentionUserIds) {
   });
 }
 
-async function forwardAlert(message, analysis, matchedTerms, mentionUserIds, forwardChannelId) {
+async function forwardAlert(
+  message,
+  analysis,
+  matchedTerms,
+  mentionUserIds,
+  forwardChannelId,
+  searchableText
+) {
   if (!forwardChannelId) return;
 
   const channel = await client.channels.fetch(forwardChannelId);
@@ -315,7 +592,7 @@ async function forwardAlert(message, analysis, matchedTerms, mentionUserIds, for
       },
       {
         name: "Original message",
-        value: truncate(message.content || "[no text content]", 1024),
+        value: truncate(searchableText || message.content || "[no text content]", 1024),
         inline: false
       }
     )
@@ -440,6 +717,8 @@ function normalizeMonitoringConfig(config) {
     actions: new Set(actions),
     analyzeWithOpenAI: parseConfigBoolean(config.analyzeWithOpenAI, true),
     channels: normalizedChannels,
+    commandPrefix: String(config.commandPrefix || "!monitor"),
+    commandUserIds: parseStringList(config.commandUserIds || config.commandUserId || []),
     defaultTerms: parseStringList(config.defaultTerms || config.watchTerms || env.watchTerms),
     forwardChannelId: String(config.forwardChannelId || env.forwardChannelId || ""),
     mentionInForward: Boolean(config.mentionInForward ?? env.mentionInForward),
