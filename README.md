@@ -33,6 +33,8 @@ MONITORING_CONFIG_REFRESH_SECONDS=300
 
 Then edit `config/monitoring.json` in GitHub whenever you need to change watched channels, keywords, tagged users, or forwarding channels. The bot reloads it automatically every 5 minutes by default.
 
+Set `"analyzeWithOpenAI": false` for keyword-only testing. In that mode, matching terms trigger alerts without calling OpenAI.
+
 `MONITORED_CHANNEL_IDS` controls which Discord channels are watched. Use comma-separated channel IDs, or leave it blank to watch every text channel the bot can access.
 
 `WATCH_TERMS` controls the first filter. If any term appears in a message, the bot sends the message to OpenAI for analysis. Leave it blank to analyze every message in monitored channels.

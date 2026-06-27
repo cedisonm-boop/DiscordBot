@@ -65,7 +65,9 @@ client.on(Events.MessageCreate, async (message) => {
     const matchedTerms = getMatchedTerms(message.content, channelRule.terms);
     if (channelRule.terms.length > 0 && matchedTerms.length === 0) return;
 
-    const analysis = await analyzeMessage(message, matchedTerms, channelRule.terms);
+    const analysis = channelRule.analyzeWithOpenAI
+      ? await analyzeMessage(message, matchedTerms, channelRule.terms)
+      : buildKeywordOnlyAnalysis(matchedTerms);
     if (!analysis.shouldAlert) return;
 
     await runAlertActions(message, analysis, matchedTerms, channelRule);
@@ -162,7 +164,8 @@ function getChannelRule(channelId) {
       channelId,
       terms: rule.terms,
       mentionUserIds: rule.mentionUserIds,
-      forwardChannelId: rule.forwardChannelId
+      forwardChannelId: rule.forwardChannelId,
+      analyzeWithOpenAI: rule.analyzeWithOpenAI
     };
   }
 
@@ -181,7 +184,8 @@ function getChannelRule(channelId) {
     channelId,
     terms: monitoringConfig.defaultTerms,
     mentionUserIds: monitoringConfig.mentionUserIds,
-    forwardChannelId: monitoringConfig.forwardChannelId
+    forwardChannelId: monitoringConfig.forwardChannelId,
+    analyzeWithOpenAI: monitoringConfig.analyzeWithOpenAI
   };
 }
 
@@ -225,6 +229,16 @@ async function analyzeMessage(message, matchedTerms, watchedTerms) {
   }
 
   return response.output_parsed;
+}
+
+function buildKeywordOnlyAnalysis(matchedTerms) {
+  return {
+    shouldAlert: true,
+    priority: "medium",
+    category: "keyword-match",
+    summary: `Matched watched term(s): ${matchedTerms.join(", ")}`,
+    reason: "OpenAI analysis is disabled for this rule, so this alert was triggered by keyword matching only."
+  };
 }
 
 async function runAlertActions(message, analysis, matchedTerms, channelRule) {
@@ -382,7 +396,8 @@ function buildEnvMonitoringConfig() {
       {
         terms: rule.terms,
         mentionUserIds: channelMentionsById.get(rule.channelId) || [],
-        forwardChannelId: env.forwardChannelId || ""
+        forwardChannelId: env.forwardChannelId || "",
+        analyzeWithOpenAI: true
       }
     ])
   );
@@ -390,6 +405,7 @@ function buildEnvMonitoringConfig() {
   return normalizeMonitoringConfig({
     actions: [...env.alertActions],
     defaultTerms: env.watchTerms,
+    analyzeWithOpenAI: true,
     forwardChannelId: env.forwardChannelId || "",
     mentionInForward: env.mentionInForward,
     mentionUserIds: env.mentionUserIds,
@@ -402,10 +418,13 @@ function normalizeMonitoringConfig(config) {
   const normalizedChannels = {};
 
   for (const [channelId, channelConfig] of Object.entries(config.channels || {})) {
+    const defaultAnalyzeWithOpenAI = parseConfigBoolean(config.analyzeWithOpenAI, true);
+
     normalizedChannels[channelId] = {
       terms: parseStringList(channelConfig.terms || channelConfig.watchTerms),
       mentionUserIds: parseStringList(channelConfig.mentionUserIds || channelConfig.mentionUserId),
-      forwardChannelId: String(channelConfig.forwardChannelId || config.forwardChannelId || "")
+      forwardChannelId: String(channelConfig.forwardChannelId || config.forwardChannelId || ""),
+      analyzeWithOpenAI: parseConfigBoolean(channelConfig.analyzeWithOpenAI, defaultAnalyzeWithOpenAI)
     };
   }
 
@@ -419,6 +438,7 @@ function normalizeMonitoringConfig(config) {
 
   return {
     actions: new Set(actions),
+    analyzeWithOpenAI: parseConfigBoolean(config.analyzeWithOpenAI, true),
     channels: normalizedChannels,
     defaultTerms: parseStringList(config.defaultTerms || config.watchTerms || env.watchTerms),
     forwardChannelId: String(config.forwardChannelId || env.forwardChannelId || ""),
@@ -426,4 +446,10 @@ function normalizeMonitoringConfig(config) {
     mentionUserIds: parseStringList(config.mentionUserIds || config.mentionUserId || env.mentionUserIds),
     monitoredChannelIds: parseStringList(config.monitoredChannelIds || env.monitoredChannelIds)
   };
+}
+
+function parseConfigBoolean(value, fallback) {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (typeof value === "boolean") return value;
+  return ["1", "true", "yes", "on"].includes(String(value).toLowerCase());
 }

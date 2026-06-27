@@ -1,20 +1,21 @@
 {
   "actions": ["mention", "forward"],
-  "defaultTerms": ["urgent", "refund", "chargeback", "security"],
-  "forwardChannelId": "REPLACE_ALERT_CHANNEL_ID",
-  "mentionInForward": false,
+  "analyzeWithOpenAI": false,
+  "defaultTerms": [],
+  "forwardChannelId": "1520512853361037342",
+  "mentionInForward": true,
   "mentionUserIds": [],
   "monitoredChannelIds": [],
   "channels": {
-    "REPLACE_MONITORED_CHANNEL_ID_1": {
-      "terms": ["refund", "chargeback", "payment"],
-      "mentionUserIds": ["REPLACE_USER_ID_TO_TAG"],
-      "forwardChannelId": "REPLACE_ALERT_CHANNEL_ID"
-    },
-    "REPLACE_MONITORED_CHANNEL_ID_2": {
-      "terms": ["security", "login", "password"],
-      "mentionUserIds": ["REPLACE_USER_ID_TO_TAG"],
-      "forwardChannelId": "REPLACE_ALERT_CHANNEL_ID"
+    "1515161469954818098": {
+      "terms": [
+        "looking for accommodation",
+        "looking to rent",
+        "looking for availability"
+      ],
+      "mentionUserIds": ["1301533439224451103"],
+      "forwardChannelId": "1520512853361037342",
+      "analyzeWithOpenAI": false
     }
   }
 }

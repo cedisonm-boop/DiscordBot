@@ -106,6 +106,7 @@ Use this shape:
 ```json
 {
   "actions": ["mention", "forward"],
+  "analyzeWithOpenAI": false,
   "defaultTerms": ["urgent", "refund", "chargeback", "security"],
   "forwardChannelId": "ALERT_CHANNEL_ID",
   "mentionInForward": false,
@@ -115,10 +116,13 @@ Use this shape:
     "CHANNEL_ID_TO_WATCH": {
       "terms": ["refund", "chargeback", "payment"],
       "mentionUserIds": ["USER_ID_TO_TAG"],
-      "forwardChannelId": "ALERT_CHANNEL_ID"
+      "forwardChannelId": "ALERT_CHANNEL_ID",
+      "analyzeWithOpenAI": false
     }
   }
 }
 ```
+
+Set `"analyzeWithOpenAI": false` for keyword-only testing. Set it to `true` when you want OpenAI analysis to decide whether a matched message should alert.
 
 Discord tokens and OpenAI API keys still belong only in Lightsail `.env`, never in GitHub.
